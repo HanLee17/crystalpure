@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Panel de Calidad de Agua</title>
+  <!-- Chart.js CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    const chartReady = typeof Chart !== 'undefined';
+    if(!chartReady){
+      console.warn('Chart.js no pudo cargarse; las gráficas estarán deshabilitadas.');
+    }
+  </script>
+  <style>
+    :root{
+      --bg:#18181b;
+      --card:#1e1e22;
+      --primary:#2563eb;
+      --primary-dark:#1d4ed8;
+      --text:#e5e5e5;
+      --accent:#38bdf8;
+    }
+    *{box-sizing:border-box}
+    body{
+      font-family: system-ui, sans-serif;
+      background:var(--bg);
+      color:var(--text);
+      margin:0;
+      display:flex;
+      flex-direction:column;
+      align-items:center;
+      padding:2rem;
+      gap:1.5rem;
+    }
+    h1{margin:0 0 0.5rem}
+    #status{font-size:0.9rem;color:var(--accent)}
+    button{
+      background:var(--primary);
+      color:white;
+      padding:0.6rem 1.2rem;
+      border:none;
+      border-radius:0.5rem;
+      font-size:1rem;
+      cursor:pointer;
+      transition:background 200ms ease;
+    }
+    button:hover{background:var(--primary-dark)}
+
+    #cards{
+      display:grid;
+      grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+      gap:1rem;
+      width:100%;
+      max-width:900px;
+    }
+    .card{
+      background:var(--card);
+      padding:1rem 1.25rem;
+      border-radius:0.75rem;
+      box-shadow:0 4px 6px rgb(0 0 0 / .25);
+      text-align:center;
+    }
+    .card h3{margin:0 0 0.25rem;font-size:1.1rem;color:var(--accent)}
+    .value{font-size:1.8rem;font-weight:600;margin-bottom:0.25rem}
+    small{color:#9ca3af}
+
+    canvas{max-width:900px;margin-top:1.5rem}
+    @media(max-width:940px){canvas{max-width:100%}}
+  </style>
+</head>
+<body>
+  <h1>💧 Panel de Calidad de Agua</h1>
+  <div id="status">🔌 Sin conexión</div>
+  <div style="display:flex;gap:0.75rem">
+    <button id="connectBtn">Conectar Arduino</button>
+    <button id="resetBtn" disabled>Reiniciar promedios</button>
+  </div>
+
+  <!-- Tarjetas métricas -->
+  <section id="cards">
+    <div class="card">
+      <h3>Turbidez actual</h3>
+      <div id="ntuNow" class="value">--</div>
+      <small>Promedio (1 min): <span id="ntuAvgWin">--</span></small><br>
+      <small>Promedio sesión: <span id="ntuAvgAll">--</span></small>
+    </div>
+    <div class="card">
+      <h3>TDS actual</h3>
+      <div id="tdsNow" class="value">--</div>
+      <small>Promedio (1 min): <span id="tdsAvgWin">--</span></small><br>
+      <small>Promedio sesión: <span id="tdsAvgAll">--</span></small>
+    </div>
+  </section>
+
+  <canvas id="ntuChart"></canvas>
+  <canvas id="tdsChart"></canvas>
+
+<script>
+/* ================== Configuración ================== */
+const MAX_POINTS = 60; // 60 s (asumiendo 1 Hz)
+const labels = Array(MAX_POINTS).fill('');
+const ntuData = [];
+const tdsData = [];
+
+// Para promedios globales
+let sumNTU = 0, sumTDS = 0, countAll = 0;
+
+/* ================== Gráficos ================== */
+let ntuChart = null;
+let tdsChart = null;
+if(chartReady){
+  ntuChart = new Chart(document.getElementById('ntuChart'), {
+    type:'line',
+    data:{labels,datasets:[{label:'Turbidez (NTU)',data:ntuData,borderWidth:2,fill:false}]},
+    options:{responsive:true,animation:false,scales:{y:{title:{display:true,text:'NTU'}}}}
+  });
+
+  tdsChart = new Chart(document.getElementById('tdsChart'), {
+    type:'line',
+    data:{labels,datasets:[{label:'TDS (ppm)',data:tdsData,borderWidth:2,fill:false,tension:0.25}]},
+    options:{responsive:true,animation:false,scales:{y:{title:{display:true,text:'ppm'}}}}
+  });
+}
+
+/* ============== Web Serial ============== */
+const statusEl = document.getElementById('status');
+const connectBtn = document.getElementById('connectBtn');
+const resetBtn   = document.getElementById('resetBtn');
+
+let port, reader;
+
+async function connect(){
+  try{
+    port = await navigator.serial.requestPort();
+    await port.open({baudRate:9600});
+    statusEl.textContent = '✅ Conectado – esperando datos…';
+    connectBtn.disabled = true;
+    resetBtn.disabled = false;
+
+    const decoder = new TextDecoderStream();
+    port.readable.pipeTo(decoder.writable);
+    reader = decoder.readable.getReader();
+
+    readLoop();
+  }catch(err){
+    console.error(err);
+    statusEl.textContent = '❌ ' + err;
+  }
+}
+
+async function readLoop(){
+  let buffer='';
+  try{
+    while(true){
+      const { value, done } = await reader.read();
+      if(done) break;
+      buffer += value;
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      lines.forEach(handleLine);
+    }
+  }catch(err){
+    console.error(err);
+    statusEl.textContent = '⚠️ Desconectado';
+    connectBtn.disabled = false;
+    resetBtn.disabled = true;
+    if(port) port.close();
+  }
+}
+
+function handleLine(line){
+  line = line.trim();
+  if(!line) return;
+  const parts = line.split(/\s+/);
+  if(parts.length < 2) return;
+  const ntu = parseFloat(parts[0]);
+  const tds = parseFloat(parts[1]);
+  if(isNaN(ntu) || isNaN(tds)) return;
+
+  pushData(ntuChart, ntuData, ntu);
+  pushData(tdsChart, tdsData, tds);
+
+  // Estadísticas
+  sumNTU += ntu; sumTDS += tds; countAll++;
+  updateUI(ntu, tds);
+}
+
+function pushData(chart, arr, val){
+  arr.push(val);
+  if(arr.length > MAX_POINTS) arr.shift();
+  if(chart) chart.update('none');
+}
+
+function promedio(arr){
+  if(arr.length === 0) return NaN;
+  return arr.reduce((a,b)=>a+b,0) / arr.length;
+}
+
+function updateUI(ntu, tds){
+  document.getElementById('ntuNow').textContent = isNaN(ntu) ? '--' : ntu.toFixed(1);
+  document.getElementById('tdsNow').textContent = isNaN(tds) ? '--' : tds.toFixed(0);
+
+  const ntuWin = promedio(ntuData);
+  const tdsWin = promedio(tdsData);
+  const ntuAll = sumNTU / countAll;
+  const tdsAll = sumTDS / countAll;
+
+  document.getElementById('ntuAvgWin').textContent = isNaN(ntuWin) ? '--' : ntuWin.toFixed(1);
+  document.getElementById('tdsAvgWin').textContent = isNaN(tdsWin) ? '--' : tdsWin.toFixed(0);
+
+  document.getElementById('ntuAvgAll').textContent = isNaN(ntuAll) ? '--' : ntuAll.toFixed(1);
+  document.getElementById('tdsAvgAll').textContent = isNaN(tdsAll) ? '--' : tdsAll.toFixed(0);
+}
+
+/* ============== Eventos UI ============== */
+connectBtn.addEventListener('click', ()=>{
+  if('serial' in navigator) connect();
+  else alert('Tu navegador no soporta Web Serial API (prueba Chrome o Edge).');
+});
+
+resetBtn.addEventListener('click', ()=>{
+  sumNTU = sumTDS = countAll = 0;
+  // Al reiniciar, los promedios de ventana y actuales pueden quedar en NaN o "--",
+  // ya que no hay datos recientes hasta que se reciba la primera lectura.
+  // Para un reinicio visual completo, podrías hacer esto:
+  // ntuData.length = 0;
+  // tdsData.length = 0;
+  // ntuChart.update('none');
+  // tdsChart.update('none');
+  updateUI(NaN, NaN); // Llama con NaN para restablecer los textos
+});
+</script>
+</body>
+</html>
